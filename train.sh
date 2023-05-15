@@ -1,0 +1,15 @@
+python main_moco.py \
+    --data /workspace/storage/data/ssl4eo/l7-l2/imgs/ \
+    --arch resnet50 \
+    --lr 0.03 \
+    --workers 128 \
+    --epochs 100 \
+    --batch-size 512 \
+    --dist-url 'tcp://localhost:10001' \
+    --multiprocessing-distributed \
+    --world-size 1 \
+    --rank 0 \
+    --aug-plus \
+    --mlp \
+    --cos \
+    --moco-t 0.2 \

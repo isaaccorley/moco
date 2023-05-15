@@ -14,6 +14,7 @@ import random
 import shutil
 import time
 import warnings
+from functools import partial
 
 import moco.builder
 import moco.loader
@@ -26,9 +27,23 @@ import torch.nn.parallel
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
-import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
+
+
+import timm
+from torch.utils.tensorboard import SummaryWriter
+import kornia.augmentation as K
+from torchgeo.datasets import SSL4EOL
+
+
+class RandomGrayscale(K.RandomGrayscale):
+    def apply_transform(self, input, params, flags, transform):
+        b, c, h, w = input.shape
+        grayscale = input.mean(dim=1, keepdim=True)
+        grayscale = grayscale.tile((1, c, 1, 1))
+        return grayscale
+
 
 
 model_names = sorted(
@@ -38,7 +53,9 @@ model_names = sorted(
 )
 
 parser = argparse.ArgumentParser(description="PyTorch ImageNet Training")
-parser.add_argument("data", metavar="DIR", help="path to dataset")
+parser.add_argument("--data", metavar="DIR", help="path to dataset")
+parser.add_argument('--checkpoints', metavar='DIR', default='./checkpoints',
+                    help='path to checkpoints')
 parser.add_argument(
     "-a",
     "--arch",
@@ -243,15 +260,28 @@ def main_worker(gpu, ngpus_per_node, args):
             world_size=args.world_size,
             rank=args.rank,
         )
+
+    # create tb_writer
+    if args.rank == 0 and not os.path.isdir(args.checkpoints):
+        os.makedirs(args.checkpoints, exist_ok=True)
+    if args.rank == 0:
+        tb_writer = SummaryWriter(os.path.join(args.checkpoints, 'log'))
+
     # create model
     print("=> creating model '{}'".format(args.arch))
+    base_encoder = partial(
+        timm.create_model,
+        model_name=args.arch,
+        pretrained=True,
+        in_chans=6,
+    )
     model = moco.builder.MoCo(
-        models.__dict__[args.arch],
-        args.moco_dim,
-        args.moco_k,
-        args.moco_m,
-        args.moco_t,
-        args.mlp,
+        base_encoder=base_encoder,
+        dim=args.moco_dim,
+        K=args.moco_k,
+        m=args.moco_m,
+        T=args.moco_t,
+        mlp=args.mlp,
     )
     print(model)
 
@@ -318,24 +348,18 @@ def main_worker(gpu, ngpus_per_node, args):
 
     cudnn.benchmark = True
 
-    # Data loading code
-    traindir = os.path.join(args.data, "train")
-    normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-    )
     if args.aug_plus:
         # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
-        augmentation = [
-            transforms.RandomResizedCrop(224, scale=(0.2, 1.0)),
-            transforms.RandomApply(
-                [transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8  # not strengthened
-            ),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply([moco.loader.GaussianBlur([0.1, 2.0])], p=0.5),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]
+        augmentations = nn.Sequential(
+            K.Normalize(mean=torch.tensor(0.0), std=torch.tensor(255.0)),
+            K.RandomHorizontalFlip(p=0.5),
+            K.RandomVerticalFlip(p=0.5),
+            K.RandomBrightness(brightness=(0.8, 1.0), p=0.8),
+            K.RandomContrast(contrast=(0.8, 1.0), p=0.8),
+            K.RandomGaussianBlur(kernel_size=3, sigma=[0.1, 2.0], p=0.5),
+            K.RandomResizedCrop((224, 224), scale=(0.2, 1.0), p=1.0),
+            RandomGrayscale(p=0.2),
+        )
     else:
         # MoCo v1's aug: the same as InstDisc https://arxiv.org/abs/1805.01978
         augmentation = [
@@ -344,12 +368,14 @@ def main_worker(gpu, ngpus_per_node, args):
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            normalize,
+            #normalize,
         ]
 
-    train_dataset = datasets.ImageFolder(
-        traindir, moco.loader.TwoCropsTransform(transforms.Compose(augmentation))
-    )
+    augmentations = nn.Sequential(*augmentations).to("cuda")
+    #train_dataset = datasets.ImageFolder(
+    #    traindir, )
+    #)
+    train_dataset = SSL4EOL(root=args.data, split="tm_sr", seasons=1)
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -372,7 +398,12 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        loss, top1, top5 = train(train_loader, model, criterion, optimizer, epoch, augmentations, args)
+
+        if args.rank == 0:
+            tb_writer.add_scalar('loss', loss, global_step=epoch, walltime=None)
+            tb_writer.add_scalar('acc1', top1, global_step=epoch, walltime=None)
+            tb_writer.add_scalar('acc5', top5, global_step=epoch, walltime=None)
 
         if not args.multiprocessing_distributed or (
             args.multiprocessing_distributed and args.rank % ngpus_per_node == 0
@@ -385,11 +416,15 @@ def main_worker(gpu, ngpus_per_node, args):
                     "optimizer": optimizer.state_dict(),
                 },
                 is_best=False,
-                filename="checkpoint_{:04d}.pth.tar".format(epoch),
+                filename=os.path.join(args.checkpoints, "checkpoint_{:04d}.pth.tar".format(epoch)),
             )
 
+    print('Training finished.')
+    if args.rank == 0:
+        tb_writer.close()
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+
+def train(train_loader, model, criterion, optimizer, epoch, augmentations, args):
     batch_time = AverageMeter("Time", ":6.3f")
     data_time = AverageMeter("Data", ":6.3f")
     losses = AverageMeter("Loss", ":.4e")
@@ -405,24 +440,26 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     end = time.time()
-    for i, (images, _) in enumerate(train_loader):
+    for i, batch in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
         if args.gpu is not None:
-            images[0] = images[0].cuda(args.gpu, non_blocking=True)
-            images[1] = images[1].cuda(args.gpu, non_blocking=True)
+            batch["image"] = batch["image"].cuda(args.gpu, non_blocking=True)
+
+        im_q = augmentations(batch["image"])
+        im_k = augmentations(batch["image"])
 
         # compute output
-        output, target = model(im_q=images[0], im_k=images[1])
+        output, target = model(im_q=im_q, im_k=im_k)
         loss = criterion(output, target)
 
         # acc1/acc5 are (K+1)-way contrast classifier accuracy
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images[0].size(0))
-        top1.update(acc1[0], images[0].size(0))
-        top5.update(acc5[0], images[0].size(0))
+        losses.update(loss.item(), im_q.size(0))
+        top1.update(acc1[0], im_q.size(0))
+        top5.update(acc5[0], im_q.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -505,11 +542,11 @@ def accuracy(output, target, topk=(1,)):
 
         _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        correct = pred.eq(target.reshape(1, -1).expand_as(pred))
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
