@@ -473,6 +473,7 @@ def train(train_loader, model, criterion, optimizer, epoch, augmentations, args)
         if i % args.print_freq == 0:
             progress.display(i)
 
+    return losses.avg, top1.avg, top5.avg
 
 def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
     torch.save(state, filename)
